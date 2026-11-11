@@ -1,0 +1,16 @@
+[package]
+name = "sshremote-relay"
+version = "1.0.0"
+edition = "2024"
+description = "The relay that pairs SSH Remote computers and viewers by remote access ID"
+license = "MIT"
+repository = "https://github.com/thinkbigx/sshremote-relay"
+
+[dependencies]
+getrandom = "0.2"
+serde_json = "1"
+sha2 = "0.10"
+
+[profile.release]
+lto = true
+strip = true
