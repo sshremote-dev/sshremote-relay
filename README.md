@@ -17,7 +17,7 @@ upgrade (`GET /relay` with `Upgrade: sshremote-relay`; the client's address in `
 
 | Line | Sent by | Answer |
 |---|---|---|
-| `listen ID TOKEN` | a computer, kept open | `ok`, or `taken` (another token owns the ID); later `call NONCE` lines |
+| `listen ID TOKEN` | a computer, kept open | `ok`, or `taken` (another token owns the ID); later, per viewer, `from NONCE ADDRESS` (where the relay sees it from) and `call NONCE` |
 | `accept ID NONCE` | the computer, on a new connection | `ok`, then the viewer's bytes |
 | `viewer ID` | a viewer | `ok`, then the computer's bytes; or `offline` |
 | `status ID` | anyone | `online` or `offline` |

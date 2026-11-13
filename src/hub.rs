@@ -109,7 +109,7 @@ pub struct Hub {
     dirty: bool,
     /// ID → its listening line's number, a way to call the agent, and its token's hash (which
     /// holds the ID while it is not yet kept).
-    agents: HashMap<String, (u64, mpsc::Sender<String>, String)>,
+    agents: HashMap<String, (u64, mpsc::Sender<(String, IpAddr)>, String)>,
     next: u64,
     /// NONCE → the viewer waiting for that call to be answered.
     calls: HashMap<String, mpsc::Sender<TcpStream>>,
@@ -413,7 +413,7 @@ fn connection(hub: &Shared, mut s: TcpStream, peer: IpAddr) {
 /// newer line for the same ID replaces it. An ID nobody held becomes this token's once its
 /// agent has stayed a minute, a few new ones an address a day.
 fn listen(hub: &Shared, mut s: TcpStream, id: &str, token: &str, ip: IpAddr) {
-    let (tx, rx) = mpsc::channel::<String>();
+    let (tx, rx) = mpsc::channel::<(String, IpAddr)>();
     let (number, mut kept) = {
         let mut h = lock(hub);
         if !h.may_use(id, token) {
@@ -453,8 +453,10 @@ fn listen(hub: &Shared, mut s: TcpStream, id: &str, token: &str, ip: IpAddr) {
             }
             loop {
                 match rx.try_recv() {
-                    Ok(nonce) => {
-                        if writeln!(s, "call {nonce}").is_err() {
+                    // Where the viewer is, for a computer that takes only some addresses;
+                    // agents that do not know the line pass it by.
+                    Ok((nonce, from)) => {
+                        if writeln!(s, "from {nonce} {}\ncall {nonce}", from.to_canonical()).is_err() {
                             break 'line;
                         }
                     }
@@ -513,7 +515,7 @@ fn viewer(hub: &Shared, mut s: TcpStream, id: &str, ip: IpAddr) {
         h.calls.insert(nonce.clone(), tx);
         *h.waiting_by_id.entry(id.to_string()).or_insert(0) += 1;
     }
-    let answered = if agent.send(nonce.clone()).is_ok() { rx.recv_timeout(Duration::from_secs(20)).ok() } else { None };
+    let answered = if agent.send((nonce.clone(), ip)).is_ok() { rx.recv_timeout(Duration::from_secs(20)).ok() } else { None };
     {
         let mut h = lock(hub);
         h.calls.remove(&nonce);
@@ -620,8 +622,10 @@ mod tests {
             v.read_exact(&mut got).unwrap();
             got
         });
+        let from = line(&mut agent).unwrap();
         let call = line(&mut agent).unwrap();
         let nonce = call.strip_prefix("call ").expect("a call").to_string();
+        assert_eq!(from, format!("from {nonce} 127.0.0.1"), "where the viewer is, before its call");
         let mut a = TcpStream::connect(&addr).unwrap();
         a.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         writeln!(a, "accept {id} {nonce}").unwrap();
