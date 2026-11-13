@@ -188,12 +188,55 @@ fn lock(hub: &Shared) -> std::sync::MutexGuard<'_, Hub> {
     hub.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The start of a "where do you see me from" question on UDP, and of its answer.
+const REFLECT: &[u8] = b"sshremote-addr 1 ";
+/// Questions one address may ask a second.
+const REFLECTS_A_SECOND: u32 = 20;
+
+/// The answer to a UDP question `q` from `from`: the address and port it came from, which is
+/// where the other side of a session can reach that socket through its router (NAT hole
+/// punching). Never larger than the question, so the relay cannot amplify a flood.
+pub fn reflect_answer(q: &[u8], from: std::net::SocketAddr) -> Option<Vec<u8>> {
+    let rest = q.strip_prefix(REFLECT)?;
+    let nonce: String = std::str::from_utf8(rest).ok()?.split_whitespace().next()?.chars().take(32).collect();
+    let a = format!("{}{nonce} {from}", String::from_utf8_lossy(REFLECT)).into_bytes();
+    (a.len() <= q.len()).then_some(a)
+}
+
+/// Answers UDP questions on the relay's port, a few a second from each address.
+fn reflect(listen: &str) {
+    let sock = match std::net::UdpSocket::bind(listen) {
+        Ok(s) => s,
+        Err(e) => return eprintln!("no UDP on {listen} ({e}): sessions stay on the relay"),
+    };
+    let mut buf = [0u8; 512];
+    let mut asked: HashMap<IpAddr, (Instant, u32)> = HashMap::new();
+    let mut pruned = Instant::now();
+    loop {
+        let Ok((n, from)) = sock.recv_from(&mut buf) else { continue };
+        if pruned.elapsed() > Duration::from_secs(60) {
+            asked.retain(|_, (t, _)| t.elapsed() < Duration::from_secs(1));
+            pruned = Instant::now();
+        }
+        if !within(&mut asked, key(from.ip()), Duration::from_secs(1), REFLECTS_A_SECOND) {
+            continue;
+        }
+        if let Some(a) = reflect_answer(&buf[..n], from) {
+            let _ = sock.send_to(&a, from);
+        }
+    }
+}
+
 /// Runs the relay until the listener fails.
 pub fn serve(listen: &str, store: Option<&str>) -> Result<(), String> {
     let store = store.map(PathBuf::from);
     let hub: Shared = Arc::new(Mutex::new(Hub::new(store.as_deref())?));
     let listener = TcpListener::bind(listen).map_err(|e| format!("{listen}: {e}"))?;
-    println!("sshremote relay listening on {listen}");
+    println!("sshremote relay listening on {listen} (TCP, and UDP for where computers are seen from)");
+    {
+        let listen = listen.to_string();
+        thread::spawn(move || reflect(&listen));
+    }
     // Every 30 s: stale entries out, and the owners written (outside the lock, whole or not at all).
     {
         let hub = hub.clone();
@@ -597,5 +640,16 @@ mod tests {
         drop(agent);
         thread::sleep(Duration::from_millis(600));
         assert!(!online(id, &addr).unwrap());
+        // On UDP at the same port: where a socket is seen from, for a question at least as long
+        // as the answer.
+        let u = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        u.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut q = b"sshremote-addr 1 0123456789abcdef".to_vec();
+        q.resize(96, b' ');
+        u.send_to(&q, &addr).unwrap();
+        let mut b = [0u8; 256];
+        let (n, _) = u.recv_from(&mut b).unwrap();
+        assert_eq!(String::from_utf8_lossy(&b[..n]), format!("sshremote-addr 1 0123456789abcdef {}", u.local_addr().unwrap()));
+        assert_eq!(reflect_answer(b"sshremote-addr 1 0123456789abcdef", u.local_addr().unwrap()), None, "never larger");
     }
 }

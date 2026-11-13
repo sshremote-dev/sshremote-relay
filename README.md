@@ -22,6 +22,14 @@ upgrade (`GET /relay` with `Upgrade: sshremote-relay`; the client's address in `
 | `viewer ID` | a viewer | `ok`, then the computer's bytes; or `offline` |
 | `status ID` | anyone | `online` or `offline` |
 
+On UDP at the same port the relay answers one question, so two computers behind routers can
+find a straight path to each other (NAT hole punching): `sshremote-addr 1 NONCE`, padded with
+spaces to at least 64 bytes, is answered with `sshremote-addr 1 NONCE ADDRESS:PORT`, where it saw
+the question come from. The answer is never larger than the question, and each address gets 20
+a second. The two sides swap what they were told inside their sealed stream and move to the
+straight path once it works; the relay then carries nothing more for them. Open UDP on the
+port too (a relay without it still works, always in the middle).
+
 Limits per address (an IPv6 /64): open connections, lines a minute, calls to one ID a minute,
 new IDs a day; an ID is kept only once its computer has stayed a minute, and is released after
 180 days unseen. A pair with nothing either way for two minutes is closed.
