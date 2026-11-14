@@ -454,13 +454,18 @@ fn connection(hub: &Shared, mut s: TcpStream, peer: IpAddr) {
 
 /// The first sealed line, within `deadline`.
 fn sealed_line(s: &mut TcpStream, inn: &mut crate::link::Way, deadline: Instant) -> Option<String> {
-    let mut raw = Vec::new();
+    let (mut raw, mut words) = (Vec::new(), Vec::new());
     let mut b = [0u8; 512];
     loop {
-        if let Some(words) = inn.open(&mut raw).ok()? {
-            return Some(String::from_utf8_lossy(&words).trim().to_string());
+        // Frames until the line is whole (a line may come in pieces).
+        if let Some(w) = inn.open(&mut raw).ok()? {
+            words.extend(w);
+            if let Some(at) = words.iter().position(|c| *c == b'\n') {
+                return Some(String::from_utf8_lossy(&words[..at]).trim().to_string());
+            }
+            continue;
         }
-        if raw.len() > 4096 {
+        if raw.len() > 4096 || words.len() > 1024 {
             return None;
         }
         let left = deadline.checked_duration_since(Instant::now())?;
@@ -752,7 +757,9 @@ mod tests {
         let (e, s) = (crate::link::unhex(words[1]).unwrap(), crate::link::unhex(words[2]).unwrap());
         assert_eq!(s, LASTING.get().unwrap().1);
         let mut seal = crate::link::finish(&mine, &e, &s).unwrap();
-        agent.write_all(&seal.out.seal(format!("listen {id} 0123456789abcdef0123\n").as_bytes())).unwrap();
+        // A line in pieces, as a writer may send it.
+        agent.write_all(&seal.out.seal(b"listen ")).unwrap();
+        agent.write_all(&seal.out.seal(format!("{id} 0123456789abcdef0123\n").as_bytes())).unwrap();
         let mut raw = Vec::new();
         let mut next = |raw: &mut Vec<u8>| loop {
             if let Some(w) = seal.inn.open(raw).unwrap() {
