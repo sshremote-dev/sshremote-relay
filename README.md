@@ -21,6 +21,17 @@ upgrade (`GET /relay` with `Upgrade: sshremote-relay`; the client's address in `
 | `accept ID NONCE` | the computer, on a new connection | `ok`, then the viewer's bytes |
 | `viewer ID` | a viewer | `ok`, then the computer's bytes; or `offline` |
 | `status ID` | anyone | `online` or `offline` |
+| `secure E` | a computer, before `listen` | `secure E' S`, then a sealed line (below) |
+
+A computer seals its line to the relay (1.3 and later), so nobody in between reads its token or
+writes the lines it acts on: it sends a fresh X25519 key `E`; the relay answers with its own
+fresh key `E'` and its lasting key `S` (hex), and the keys of each direction come from HKDF-SHA256
+over both exchanges (`E` with `S`, and `E` with `E'`). Every line after that, `listen` first, goes
+as a frame: two bytes of length, then the words sealed with ChaCha20-Poly1305 (the nonce counts
+the frames). The computer checks `S` against the key it knows the relay by: the one SSH Remote
+ships with for its public relay, or the one it kept from its first visit to any other. The
+lasting key is made in `--key FILE` (by default `relay.key` beside the store) the first time and
+must stay: computers that kept it refuse a relay that shows another.
 
 On UDP at the same port the relay answers one question, so two computers behind routers can
 find a straight path to each other (NAT hole punching): `sshremote-addr 1 NONCE`, padded with

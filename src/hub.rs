@@ -24,6 +24,27 @@ fn random(n: usize) -> Vec<u8> {
     b
 }
 
+/// The relay's lasting key pair, which sealed lines are made with.
+static LASTING: std::sync::OnceLock<([u8; 32], [u8; 32])> = std::sync::OnceLock::new();
+
+/// The lasting key in `path`, made there (readable by this user alone) the first time.
+fn lasting_key(path: &std::path::Path) -> Result<([u8; 32], [u8; 32]), String> {
+    let secret: [u8; 32] = match std::fs::read(path) {
+        Ok(b) => b.try_into().map_err(|_| format!("{}: not a key", path.display()))?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let k: [u8; 32] = random(32).try_into().expect("32 bytes");
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create_new(true);
+            #[cfg(unix)]
+            std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+            o.open(path).and_then(|mut f| f.write_all(&k).and_then(|_| f.sync_all())).map_err(|e| format!("{}: {e}", path.display()))?;
+            k
+        }
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    Ok(crate::link::keypair(secret))
+}
+
 /// An ID: 6 to 12 digits.
 fn valid_id(id: &str) -> bool {
     (6..=12).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_digit())
@@ -228,8 +249,12 @@ fn reflect(listen: &str) {
 }
 
 /// Runs the relay until the listener fails.
-pub fn serve(listen: &str, store: Option<&str>) -> Result<(), String> {
+pub fn serve(listen: &str, store: Option<&str>, key_file: Option<&str>) -> Result<(), String> {
     let store = store.map(PathBuf::from);
+    let key_file = key_file.map(PathBuf::from).unwrap_or_else(|| store.as_ref().map_or_else(|| PathBuf::from("sshremote-relay.key"), |s| s.with_file_name("relay.key")));
+    let pair = lasting_key(&key_file)?;
+    let _ = LASTING.set(pair);
+    println!("sshremote relay key {}", hex(&pair.1));
     let hub: Shared = Arc::new(Mutex::new(Hub::new(store.as_deref())?));
     let listener = TcpListener::bind(listen).map_err(|e| format!("{listen}: {e}"))?;
     println!("sshremote relay listening on {listen} (TCP, and UDP for where computers are seen from)");
@@ -403,29 +428,75 @@ fn connection(hub: &Shared, mut s: TcpStream, peer: IpAddr) {
     }
     let _held = Held(hub.clone(), ip);
     match words.as_slice() {
-        ["listen", id, token] if valid_id(id) && (16..=128).contains(&token.len()) => listen(hub, s, id, token, ip),
+        ["listen", id, token] if valid_id(id) && (16..=128).contains(&token.len()) => listen(hub, s, id, token, ip, None),
         ["viewer", id] if valid_id(id) => viewer(hub, s, id, ip),
+        // A computer sealing its line: the keys, then its first line sealed.
+        ["secure", e] => {
+            let (Some(e), Some(lasting)) = (crate::link::unhex(e), LASTING.get()) else { return };
+            let Some((line, seal)) = crate::link::answer(&e, lasting, random(32).try_into().expect("32 bytes")) else { return };
+            if writeln!(s, "{line}").is_err() {
+                return;
+            }
+            let crate::link::Sealed { out, mut inn } = seal;
+            let Some(first) = sealed_line(&mut s, &mut inn, Instant::now() + HELLO) else { return };
+            let _ = s.set_read_timeout(None);
+            let words: Vec<&str> = first.split_whitespace().collect();
+            if let ["listen", id, token] = words.as_slice()
+                && valid_id(id)
+                && (16..=128).contains(&token.len())
+            {
+                listen(hub, s, id, token, ip, Some(out));
+            }
+        }
         _ => {}
+    }
+}
+
+/// The first sealed line, within `deadline`.
+fn sealed_line(s: &mut TcpStream, inn: &mut crate::link::Way, deadline: Instant) -> Option<String> {
+    let mut raw = Vec::new();
+    let mut b = [0u8; 512];
+    loop {
+        if let Some(words) = inn.open(&mut raw).ok()? {
+            return Some(String::from_utf8_lossy(&words).trim().to_string());
+        }
+        if raw.len() > 4096 {
+            return None;
+        }
+        let left = deadline.checked_duration_since(Instant::now())?;
+        s.set_read_timeout(Some(left.max(Duration::from_millis(1)))).ok()?;
+        match s.read(&mut b) {
+            Ok(n @ 1..) => raw.extend_from_slice(&b[..n]),
+            _ => return None,
+        }
+    }
+}
+
+/// Says `text` on an agent's line, sealed when the line is.
+fn say(s: &mut TcpStream, seal: &mut Option<crate::link::Way>, text: &str) -> io::Result<()> {
+    match seal {
+        Some(w) => s.write_all(&w.seal(text.as_bytes())),
+        None => s.write_all(text.as_bytes()),
     }
 }
 
 /// An agent's line: calls passed on, pings, and the line given up when it goes quiet or a
 /// newer line for the same ID replaces it. An ID nobody held becomes this token's once its
 /// agent has stayed a minute, a few new ones an address a day.
-fn listen(hub: &Shared, mut s: TcpStream, id: &str, token: &str, ip: IpAddr) {
+fn listen(hub: &Shared, mut s: TcpStream, id: &str, token: &str, ip: IpAddr, mut seal: Option<crate::link::Way>) {
     let (tx, rx) = mpsc::channel::<(String, IpAddr)>();
     let (number, mut kept) = {
         let mut h = lock(hub);
         if !h.may_use(id, token) {
             drop(h);
-            let _ = writeln!(s, "taken");
+            let _ = say(&mut s, &mut seal, "taken\n");
             return;
         }
         // New IDs are counted when kept; an address past its day's allowance waits.
         let known = h.owners.contains_key(id);
         if !known && h.new_ids.get(&key(ip)).is_some_and(|(t, n)| t.elapsed() < Duration::from_secs(24 * 3600) && *n >= NEW_IDS_A_DAY) {
             drop(h);
-            let _ = writeln!(s, "busy: too many new IDs from this address today");
+            let _ = say(&mut s, &mut seal, "busy: too many new IDs from this address today\n");
             return;
         }
         h.next += 1;
@@ -434,7 +505,7 @@ fn listen(hub: &Shared, mut s: TcpStream, id: &str, token: &str, ip: IpAddr) {
         (n, None::<Instant>)
     };
     let since = Instant::now();
-    if writeln!(s, "ok").is_ok() && s.set_read_timeout(Some(Duration::from_millis(200))).is_ok() {
+    if say(&mut s, &mut seal, "ok\n").is_ok() && s.set_read_timeout(Some(Duration::from_millis(200))).is_ok() {
         let mut heard = Instant::now();
         let mut pinged = Instant::now();
         let mut buf = [0u8; 64];
@@ -456,7 +527,7 @@ fn listen(hub: &Shared, mut s: TcpStream, id: &str, token: &str, ip: IpAddr) {
                     // Where the viewer is, for a computer that takes only some addresses;
                     // agents that do not know the line pass it by.
                     Ok((nonce, from)) => {
-                        if writeln!(s, "from {nonce} {}\ncall {nonce}", from.to_canonical()).is_err() {
+                        if say(&mut s, &mut seal, &format!("from {nonce} {}\ncall {nonce}\n", from.to_canonical())).is_err() {
                             break 'line;
                         }
                     }
@@ -466,7 +537,7 @@ fn listen(hub: &Shared, mut s: TcpStream, id: &str, token: &str, ip: IpAddr) {
                 }
             }
             if pinged.elapsed() > Duration::from_secs(30) {
-                if writeln!(s, "ping").is_err() {
+                if say(&mut s, &mut seal, "ping\n").is_err() {
                     break;
                 }
                 pinged = Instant::now();
@@ -590,7 +661,7 @@ mod tests {
         let port = 20000 + (std::process::id() % 20000) as u16;
         let addr = format!("127.0.0.1:{port}");
         let a2 = addr.clone();
-        thread::spawn(move || serve(&a2, None));
+        thread::spawn(move || serve(&a2, None, Some(&std::env::temp_dir().join(format!("relay-test-{}.key", std::process::id())).to_string_lossy())));
         thread::sleep(Duration::from_millis(300));
         let id = "987654321";
         let token = "0123456789abcdef0123";
@@ -655,5 +726,54 @@ mod tests {
         let (n, _) = u.recv_from(&mut b).unwrap();
         assert_eq!(String::from_utf8_lossy(&b[..n]), format!("sshremote-addr 1 0123456789abcdef {}", u.local_addr().unwrap()));
         assert_eq!(reflect_answer(b"sshremote-addr 1 0123456789abcdef", u.local_addr().unwrap()), None, "never larger");
+    }
+
+    /// A computer's sealed line: the keys, its line sealed, the relay's answers and a viewer's
+    /// call sealed; its lasting key the same after a restart.
+    #[test]
+    fn a_computer_seals_its_line() {
+        let port = 20001 + (std::process::id() % 20000) as u16;
+        let addr = format!("127.0.0.1:{port}");
+        let key = std::env::temp_dir().join(format!("relay-sealed-{}.key", std::process::id()));
+        let _ = std::fs::remove_file(&key);
+        let lasting = lasting_key(&key).unwrap();
+        assert_eq!(lasting_key(&key).unwrap(), lasting, "kept");
+        let (a2, k2) = (addr.clone(), key.to_string_lossy().into_owned());
+        thread::spawn(move || serve(&a2, None, Some(&k2)));
+        thread::sleep(Duration::from_millis(300));
+        let id = "987654322";
+        let mine = crate::link::keypair([3; 32]);
+        let mut agent = TcpStream::connect(&addr).unwrap();
+        agent.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        writeln!(agent, "secure {}", hex(&mine.1)).unwrap();
+        let answer = line(&mut agent).unwrap();
+        let words: Vec<&str> = answer.split(' ').collect();
+        assert_eq!(words[0], "secure");
+        let (e, s) = (crate::link::unhex(words[1]).unwrap(), crate::link::unhex(words[2]).unwrap());
+        assert_eq!(s, LASTING.get().unwrap().1);
+        let mut seal = crate::link::finish(&mine, &e, &s).unwrap();
+        agent.write_all(&seal.out.seal(format!("listen {id} 0123456789abcdef0123\n").as_bytes())).unwrap();
+        let mut raw = Vec::new();
+        let mut next = |raw: &mut Vec<u8>| loop {
+            if let Some(w) = seal.inn.open(raw).unwrap() {
+                return String::from_utf8(w).unwrap();
+            }
+            let mut b = [0u8; 256];
+            let n = agent.read(&mut b).unwrap();
+            assert!(n > 0);
+            raw.extend_from_slice(&b[..n]);
+        };
+        assert_eq!(next(&mut raw), "ok\n");
+        assert!(online(id, &addr).unwrap());
+        let a3 = addr.clone();
+        thread::spawn(move || {
+            let mut v = TcpStream::connect(&a3).unwrap();
+            writeln!(v, "viewer {id}").unwrap();
+            let _ = line(&mut v);
+        });
+        let call = next(&mut raw);
+        assert!(call.starts_with("from ") && call.contains("\ncall "), "{call}");
+        // Nothing of it in the clear on the wire: what came was all sealed.
+        let _ = std::fs::remove_file(&key);
     }
 }
