@@ -298,6 +298,9 @@ pub fn serve(listen: &str, store: Option<&str>, key_file: Option<&str>) -> Resul
     }
     for s in listener.incoming().flatten() {
         let Ok(peer) = s.peer_addr().map(|a| a.ip()) else { continue };
+        // Bytes are passed on as they come: a small write held for the last one's
+        // acknowledgement waited for the far side's delayed ack (up to 200 ms on Windows).
+        let _ = s.set_nodelay(true);
         {
             // A web server on this machine speaks for many: its clients are counted once it
             // names them.
