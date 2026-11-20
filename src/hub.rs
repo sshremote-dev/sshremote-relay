@@ -59,17 +59,31 @@ use std::time::Instant;
 /// and before that (a slow first line); lines it may send a minute, and status questions.
 const PER_ADDRESS: usize = 32;
 const HELLO_PER_ADDRESS: usize = 16;
+/// The same for a whole IPv6 /48 (one site's, a tunnel broker's): its /64s cannot take the relay.
+const PER_SITE: usize = 128;
+const HELLO_PER_SITE: usize = 64;
 const TRIES_A_MINUTE: u32 = 60;
 const STATUS_A_MINUTE: u32 = 600;
-/// Calls to one ID a minute, and calls waiting for it at once.
-const CALLS_A_MINUTE: u32 = 60;
+/// Calls to one ID a minute, and calls waiting for it at once, in all and from one address:
+/// enough that guessers from many places cannot use up its owner's (the computer itself
+/// slows and stops guesses where they come from).
+const CALLS_A_MINUTE: u32 = 300;
 const CALLS_FROM_ONE_A_MINUTE: u32 = 5;
-const CALLS_WAITING: usize = 4;
-/// New IDs one address may take a day; an ID is kept only after its agent stayed a minute.
+const CALLS_WAITING: usize = 16;
+const CALLS_WAITING_FROM_ONE: usize = 2;
+/// How long a call waits for its computer to answer (one that turns it away does not).
+const ANSWER_WAIT: Duration = Duration::from_secs(10);
+/// New IDs one address may begin to use a day (each listen for one counts); an ID is kept
+/// only after its agent stayed a minute.
 const NEW_IDS_A_DAY: u32 = 50;
 const SETTLE: Duration = Duration::from_secs(60);
-/// Connections in all, so a flood cannot take the machine's threads.
-const ALL: usize = 4000;
+/// Connections in all, so a flood cannot take the machine's threads; each thread's stack.
+const ALL: usize = 20_000;
+const STACK: usize = 256 << 10;
+/// A peer that stops reading is given up after this long, rather than holding a thread.
+const WRITE_WAIT: Duration = Duration::from_secs(30);
+/// Addresses whose UDP questions are counted at once (spoofed ones by the million are not).
+const ASKED_MOST: usize = 65_536;
 /// The first line (and an HTTP upgrade's headers) must come within this.
 const HELLO: Duration = Duration::from_secs(10);
 /// A paired session with nothing either way for this long is over (sessions ping every second).
@@ -80,13 +94,50 @@ const KEEP_ID: u64 = 180 * 24 * 3600;
 
 /// The part of an address that limits count by: all of IPv4, the /64 of IPv6.
 fn key(ip: IpAddr) -> IpAddr {
-    match ip {
+    prefix(ip, 4)
+}
+
+/// The first `segments` of an IPv6 address (16 bits each), the rest zero; IPv4 as it is.
+fn prefix(ip: IpAddr, segments: usize) -> IpAddr {
+    match ip.to_canonical() {
         IpAddr::V6(v6) => {
             let mut s = v6.segments();
-            s[4..].fill(0);
+            s[segments..].fill(0);
             IpAddr::V6(std::net::Ipv6Addr::from(s))
         }
         v4 => v4,
+    }
+}
+
+/// The /48 an IPv6 address is in, counted on its own; None for IPv4 (its address is its own).
+/// Marked in its last bits, which no /64's count ever has, so the two never share a count.
+fn site(ip: IpAddr) -> Option<IpAddr> {
+    match prefix(ip, 3) {
+        IpAddr::V6(v6) => {
+            let mut s = v6.segments();
+            s[7] = 0x5173;
+            Some(IpAddr::V6(std::net::Ipv6Addr::from(s)))
+        }
+        IpAddr::V4(_) => None,
+    }
+}
+
+/// One more held by an address and its site, if both are within their limits.
+fn up_both(map: &mut HashMap<IpAddr, usize>, ip: IpAddr, per_address: usize, per_site: usize) -> bool {
+    let site = site(ip);
+    if site.is_some_and(|s| map.get(&s).is_some_and(|n| *n >= per_site)) || !up(map, key(ip), per_address) {
+        return false;
+    }
+    if let Some(s) = site {
+        *map.entry(s).or_insert(0) += 1;
+    }
+    true
+}
+
+fn down_both(map: &mut HashMap<IpAddr, usize>, ip: IpAddr) {
+    down(map, key(ip));
+    if let Some(s) = site(ip) {
+        down(map, s);
     }
 }
 
@@ -138,6 +189,7 @@ pub struct Hub {
     calls_by_id: HashMap<String, (Instant, u32)>,
     calls_by_source: HashMap<(String, IpAddr), (Instant, u32)>,
     waiting_by_id: HashMap<String, usize>,
+    waiting_by_source: HashMap<(String, IpAddr), usize>,
     /// Lines and status questions by address in the current minute; new IDs by address today.
     tries: HashMap<IpAddr, (Instant, u32)>,
     statuses: HashMap<IpAddr, (Instant, u32)>,
@@ -235,8 +287,16 @@ fn reflect(listen: &str) {
     let mut pruned = Instant::now();
     loop {
         let Ok((n, from)) = sock.recv_from(&mut buf) else { continue };
-        if pruned.elapsed() > Duration::from_secs(60) {
+        // Only questions are counted, and never more addresses than so many (a flood of made-up
+        // ones is forgotten, not kept).
+        if !buf[..n].starts_with(REFLECT) {
+            continue;
+        }
+        if pruned.elapsed() > Duration::from_secs(60) || asked.len() >= ASKED_MOST {
             asked.retain(|_, (t, _)| t.elapsed() < Duration::from_secs(1));
+            if asked.len() >= ASKED_MOST {
+                asked.clear();
+            }
             pruned = Instant::now();
         }
         if !within(&mut asked, key(from.ip()), Duration::from_secs(1), REFLECTS_A_SECOND) {
@@ -274,9 +334,11 @@ pub fn serve(listen: &str, store: Option<&str>, key_file: Option<&str>) -> Resul
                     if !std::mem::take(&mut h.dirty) {
                         continue;
                     }
-                    let map: serde_json::Map<String, serde_json::Value> = h.owners.iter().map(|(id, (hh, t))| (id.clone(), serde_json::json!([hh, t]))).collect();
-                    serde_json::Value::Object(map).to_string()
+                    // Copied under the lock, made into text out of it: calls go on meanwhile.
+                    h.owners.clone()
                 };
+                let map: serde_json::Map<String, serde_json::Value> = snapshot.iter().map(|(id, (hh, t))| (id.clone(), serde_json::json!([hh, t]))).collect();
+                let snapshot = serde_json::Value::Object(map).to_string();
                 if let Some(f) = &store {
                     let tmp = f.with_extension("new");
                     let done = std::fs::File::create(&tmp).and_then(|mut o| {
@@ -305,22 +367,30 @@ pub fn serve(listen: &str, store: Option<&str>, key_file: Option<&str>) -> Resul
             // A web server on this machine speaks for many: its clients are counted once it
             // names them.
             let mut h = lock(&hub);
-            if h.all >= ALL || (!peer.is_loopback() && !up(&mut h.hello, key(peer), HELLO_PER_ADDRESS)) {
+            if h.all >= ALL || (!peer.is_loopback() && !up_both(&mut h.hello, peer, HELLO_PER_ADDRESS, HELLO_PER_SITE)) {
                 continue;
             }
             h.all += 1;
         }
-        let hub = hub.clone();
-        thread::spawn(move || {
+        let mine = hub.clone();
+        let spawned = thread::Builder::new().stack_size(STACK).spawn(move || {
             struct All(Shared);
             impl Drop for All {
                 fn drop(&mut self) {
                     lock(&self.0).all -= 1;
                 }
             }
-            let _all = All(hub.clone());
-            connection(&hub, s, peer);
+            let _all = All(mine.clone());
+            connection(&mine, s, peer);
         });
+        // No thread for it: what it was counted for is given back.
+        if spawned.is_err() {
+            let mut h = lock(&hub);
+            h.all -= 1;
+            if !peer.is_loopback() {
+                down_both(&mut h.hello, peer);
+            }
+        }
     }
     Ok(())
 }
@@ -367,7 +437,7 @@ fn hello(hub: &Shared, s: &mut TcpStream, peer: IpAddr, counted: &mut Option<IpA
         if peer.is_loopback() {
             ip = real?;
             // Counted as its own address from here, as a direct connection is from the start.
-            if !up(&mut lock(hub).hello, key(ip), HELLO_PER_ADDRESS) {
+            if !up_both(&mut lock(hub).hello, ip, HELLO_PER_ADDRESS, HELLO_PER_SITE) {
                 return None;
             }
             *counted = Some(ip);
@@ -380,15 +450,16 @@ fn hello(hub: &Shared, s: &mut TcpStream, peer: IpAddr, counted: &mut Option<IpA
 }
 
 fn connection(hub: &Shared, mut s: TcpStream, peer: IpAddr) {
+    let _ = s.set_write_timeout(Some(WRITE_WAIT));
     let mut counted = None;
     let asked = hello(hub, &mut s, peer, &mut counted);
     {
         let mut h = lock(hub);
         if !peer.is_loopback() {
-            down(&mut h.hello, key(peer));
+            down_both(&mut h.hello, peer);
         }
         if let Some(c) = counted {
-            down(&mut h.hello, key(c));
+            down_both(&mut h.hello, c);
         }
     }
     let Some((first, ip)) = asked else { return };
@@ -417,7 +488,7 @@ fn connection(hub: &Shared, mut s: TcpStream, peer: IpAddr) {
     }
     {
         let mut h = lock(hub);
-        if !within(&mut h.tries, key(ip), Duration::from_secs(60), TRIES_A_MINUTE) || !up(&mut h.held, key(ip), PER_ADDRESS) {
+        if !within(&mut h.tries, key(ip), Duration::from_secs(60), TRIES_A_MINUTE) || !up_both(&mut h.held, ip, PER_ADDRESS, PER_SITE) {
             drop(h);
             let _ = writeln!(s, "too many attempts; wait a minute");
             return;
@@ -426,7 +497,7 @@ fn connection(hub: &Shared, mut s: TcpStream, peer: IpAddr) {
     struct Held(Shared, IpAddr);
     impl Drop for Held {
         fn drop(&mut self) {
-            down(&mut lock(&self.0).held, key(self.1));
+            down_both(&mut lock(&self.0).held, self.1);
         }
     }
     let _held = Held(hub.clone(), ip);
@@ -500,9 +571,11 @@ fn listen(hub: &Shared, mut s: TcpStream, id: &str, token: &str, ip: IpAddr, mut
             let _ = say(&mut s, &mut seal, "taken\n");
             return;
         }
-        // New IDs are counted when kept; an address past its day's allowance waits.
+        // Each listen for an ID nobody keeps counts against its address's day, at once (lines
+        // that come together cannot all pass the count, nor hold IDs for ever by leaving
+        // before a minute); an address past its day's allowance waits.
         let known = h.owners.contains_key(id);
-        if !known && h.new_ids.get(&key(ip)).is_some_and(|(t, n)| t.elapsed() < Duration::from_secs(24 * 3600) && *n >= NEW_IDS_A_DAY) {
+        if !known && !within(&mut h.new_ids, key(ip), Duration::from_secs(24 * 3600), NEW_IDS_A_DAY) {
             drop(h);
             let _ = say(&mut s, &mut seal, "busy: too many new IDs from this address today\n");
             return;
@@ -523,9 +596,6 @@ fn listen(hub: &Shared, mut s: TcpStream, id: &str, token: &str, ip: IpAddr, mut
                 let mut h = lock(hub);
                 if !h.may_use(id, token) {
                     break;
-                }
-                if !h.owners.contains_key(id) {
-                    within(&mut h.new_ids, key(ip), Duration::from_secs(24 * 3600), u32::MAX);
                 }
                 h.keep(id, token);
                 kept = Some(Instant::now());
@@ -577,13 +647,16 @@ fn viewer(hub: &Shared, mut s: TcpStream, id: &str, ip: IpAddr) {
     };
     let nonce = hex(&random(16));
     let (tx, rx) = mpsc::channel();
+    let from_one = (id.to_string(), key(ip));
     {
         let mut h = lock(hub);
         let waiting = h.waiting_by_id.get(id).copied().unwrap_or(0);
+        let waiting_here = h.waiting_by_source.get(&from_one).copied().unwrap_or(0);
         // A few calls a minute from any one address, so one cannot keep the owner out alone.
         let minute = Duration::from_secs(60);
         if h.calls.len() >= 10_000
             || waiting >= CALLS_WAITING
+            || waiting_here >= CALLS_WAITING_FROM_ONE
             || !within(&mut h.calls_by_source, (id.to_string(), key(ip)), minute, CALLS_FROM_ONE_A_MINUTE)
             || !within(&mut h.calls_by_id, id.to_string(), minute, CALLS_A_MINUTE)
         {
@@ -593,8 +666,9 @@ fn viewer(hub: &Shared, mut s: TcpStream, id: &str, ip: IpAddr) {
         }
         h.calls.insert(nonce.clone(), tx);
         *h.waiting_by_id.entry(id.to_string()).or_insert(0) += 1;
+        *h.waiting_by_source.entry(from_one.clone()).or_insert(0) += 1;
     }
-    let answered = if agent.send((nonce.clone(), ip)).is_ok() { rx.recv_timeout(Duration::from_secs(20)).ok() } else { None };
+    let answered = if agent.send((nonce.clone(), ip)).is_ok() { rx.recv_timeout(ANSWER_WAIT).ok() } else { None };
     {
         let mut h = lock(hub);
         h.calls.remove(&nonce);
@@ -602,6 +676,12 @@ fn viewer(hub: &Shared, mut s: TcpStream, id: &str, ip: IpAddr) {
             *n = n.saturating_sub(1);
             if *n == 0 {
                 h.waiting_by_id.remove(id);
+            }
+        }
+        if let Some(n) = h.waiting_by_source.get_mut(&from_one) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                h.waiting_by_source.remove(&from_one);
             }
         }
     }
@@ -616,15 +696,20 @@ fn viewer(hub: &Shared, mut s: TcpStream, id: &str, ip: IpAddr) {
 
 /// Copies bytes both ways until either side ends or both go quiet for [`IDLE`].
 pub fn splice(a: TcpStream, b: TcpStream) {
-    let _ = a.set_read_timeout(Some(IDLE));
-    let _ = b.set_read_timeout(Some(IDLE));
+    // A side that stops reading (or writing) holds nothing for longer than that.
+    for s in [&a, &b] {
+        let _ = s.set_read_timeout(Some(IDLE));
+        let _ = s.set_write_timeout(Some(IDLE));
+    }
     let (Ok(mut a2), Ok(mut b2)) = (a.try_clone(), b.try_clone()) else { return };
     let (mut a, mut b) = (a, b);
-    let t = thread::spawn(move || {
+    let Ok(t) = thread::Builder::new().stack_size(STACK).spawn(move || {
         let _ = io::copy(&mut a2, &mut b2);
         let _ = a2.shutdown(std::net::Shutdown::Both);
         let _ = b2.shutdown(std::net::Shutdown::Both);
-    });
+    }) else {
+        return;
+    };
     let _ = io::copy(&mut b, &mut a);
     let _ = a.shutdown(std::net::Shutdown::Both);
     let _ = b.shutdown(std::net::Shutdown::Both);
@@ -660,6 +745,48 @@ mod tests {
             "offline" => Ok(false),
             other => Err(other.to_string()),
         }
+    }
+
+    /// A whole IPv6 site's /64s together hold no more than it may; another site, or an IPv4
+    /// address, is not held back by them, and a site's count never mixes with one /64's.
+    #[test]
+    fn many_networks_of_one_site_cannot_take_the_relay() {
+        let mut held = HashMap::new();
+        let in_site = |n: u16| IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 7, n, 0, 0, 0, 1));
+        let mut taken = 0;
+        for n in 0..PER_SITE as u16 * 2 {
+            taken += up_both(&mut held, in_site(n), PER_ADDRESS, PER_SITE) as usize;
+        }
+        assert_eq!(taken, PER_SITE, "the site's /64s together");
+        assert!(up_both(&mut held, "2001:db8:8::1".parse().unwrap(), PER_ADDRESS, PER_SITE), "another site");
+        assert!(up_both(&mut held, "192.0.2.1".parse().unwrap(), PER_ADDRESS, PER_SITE));
+        assert_ne!(site(in_site(0)), Some(key(in_site(0))));
+        assert_eq!(key("::ffff:192.0.2.1".parse().unwrap()), "192.0.2.1".parse::<IpAddr>().unwrap());
+        for n in 0..PER_SITE as u16 {
+            down_both(&mut held, in_site(n));
+        }
+        assert!(up_both(&mut held, in_site(500), PER_ADDRESS, PER_SITE), "given back");
+    }
+
+    /// New IDs count against their address the moment their listen comes: lines that leave
+    /// before a minute cannot claim IDs without end; known IDs are not counted.
+    #[test]
+    fn new_ids_count_when_they_are_asked_for() {
+        let port = 20000 + ((std::process::id() + 7) % 20000) as u16;
+        let addr = format!("127.0.0.1:{port}");
+        let a2 = addr.clone();
+        thread::spawn(move || serve(&a2, None, Some(&std::env::temp_dir().join(format!("relay-test-ids-{}.key", std::process::id())).to_string_lossy())));
+        thread::sleep(Duration::from_millis(300));
+        let ask = |id: String| {
+            let mut s = TcpStream::connect(&addr).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            writeln!(s, "listen {id} 0123456789abcdef0123").unwrap();
+            line(&mut s).unwrap()
+        };
+        for n in 0..NEW_IDS_A_DAY {
+            assert_eq!(ask(format!("5550{n:05}")), "ok");
+        }
+        assert!(ask("555099999".into()).starts_with("busy"), "past the day's new IDs");
     }
 
     /// The relay's side: an ID claimed by its token, its status, a viewer's call answered by a
