@@ -73,7 +73,7 @@ impl Way {
             return Ok(None);
         }
         let len = u16::from_be_bytes([raw[0], raw[1]]) as usize;
-        if len < 16 || len > MOST + 16 {
+        if !(16..=MOST + 16).contains(&len) {
             return Err(());
         }
         if raw.len() < 2 + len {

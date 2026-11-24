@@ -174,6 +174,10 @@ fn down(map: &mut HashMap<IpAddr, usize>, k: IpAddr) {
     }
 }
 
+/// A listening agent: its line's number, the way to call it (a nonce and where the viewer is), and
+/// its token's hash.
+type Listening = (u64, mpsc::Sender<(String, IpAddr)>, String);
+
 #[derive(Default)]
 pub struct Hub {
     /// ID → the token's hash and when it was last seen, kept on disk so an ID stays its owner's.
@@ -181,7 +185,7 @@ pub struct Hub {
     dirty: bool,
     /// ID → its listening line's number, a way to call the agent, and its token's hash (which
     /// holds the ID while it is not yet kept).
-    agents: HashMap<String, (u64, mpsc::Sender<(String, IpAddr)>, String)>,
+    agents: HashMap<String, Listening>,
     next: u64,
     /// NONCE → the viewer waiting for that call to be answered.
     calls: HashMap<String, mpsc::Sender<TcpStream>>,
