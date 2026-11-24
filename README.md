@@ -45,6 +45,13 @@ Limits per address (an IPv6 /64): open connections, lines a minute, calls to one
 new IDs a day; an ID is kept only once its computer has stayed a minute, and is released after
 180 days unseen. A pair with nothing either way for two minutes is closed.
 
+## Building
+
+    cargo build --release
+    cargo test
+
+It is one small crate with no system libraries; the binary is `target/release/sshremote-relay`.
+
 ## Running it as a service
 
     sudo install -m 755 target/release/sshremote-relay /usr/local/bin/
@@ -60,3 +67,7 @@ with
 
 When only ports 80 and 443 reach the server, let the web server pass `/relay` to it (SSH Remote
 falls back to port 80 by itself).
+
+## License
+
+MIT, see [LICENSE](LICENSE).
