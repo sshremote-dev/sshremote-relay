@@ -1,6 +1,6 @@
 # sshremote-relay
 
-The relay behind remote access by ID in [SSH Remote](https://github.com/thinkbigx/sshremote).
+The relay behind remote access by ID in [SSH Remote](https://github.com/sshremote-dev/sshremote).
 A computer with remote access on keeps a line open here under its 9-digit ID; a viewer asks for
 that ID, the relay asks the computer to call back, and from then on copies the bytes of the pair
 both ways. Both sides seal everything after their first line (SPAKE2 on the password, then
