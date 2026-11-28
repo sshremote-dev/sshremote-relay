@@ -64,6 +64,8 @@ const PER_SITE: usize = 128;
 const HELLO_PER_SITE: usize = 64;
 const TRIES_A_MINUTE: u32 = 60;
 const STATUS_A_MINUTE: u32 = 600;
+/// How long a `seen` line is held open at most, for the straight TCP path being tried.
+const SEEN_HELD: Duration = Duration::from_secs(30);
 /// Calls to one ID a minute, and calls waiting for it at once, in all and from one address:
 /// enough that guessers from many places cannot use up its owner's (the computer itself
 /// slows and stops guesses where they come from).
@@ -488,6 +490,26 @@ fn connection(hub: &Shared, mut s: TcpStream, peer: IpAddr) {
             let _ = writeln!(s, "{}", if !ok { "too many attempts; wait a minute" } else if on { "online" } else { "offline" });
             return;
         }
+        // Where this connection comes from, address and port, for a straight TCP path through
+        // the routers: the line stays open a while (or until the computer closes it) so its
+        // router keeps the way it made for it. Through the web server the port is unknown.
+        ["seen"] => {
+            let held = {
+                let mut h = lock(hub);
+                within(&mut h.statuses, key(ip), Duration::from_secs(60), STATUS_A_MINUTE) && up_both(&mut h.held, ip, PER_ADDRESS, PER_SITE)
+            };
+            if !held {
+                let _ = writeln!(s, "too many attempts; wait a minute");
+                return;
+            }
+            let at = s.peer_addr().ok().filter(|a| !a.ip().is_loopback());
+            let _ = writeln!(s, "{}", at.map_or_else(|| "unknown".to_string(), |a| a.to_string()));
+            let _ = s.set_read_timeout(Some(SEEN_HELD));
+            let mut b = [0u8; 16];
+            while matches!(s.read(&mut b), Ok(1..)) {}
+            down_both(&mut lock(hub).held, ip);
+            return;
+        }
         _ => {}
     }
     {
@@ -770,6 +792,30 @@ mod tests {
             down_both(&mut held, in_site(n));
         }
         assert!(up_both(&mut held, in_site(500), PER_ADDRESS, PER_SITE), "given back");
+    }
+
+    /// A connection is told the address and port it comes from, for a straight TCP path; one
+    /// through a web server on this machine (a loopback one) is told that is unknown.
+    #[test]
+    fn a_connection_is_told_where_it_is_seen_from() {
+        // This machine's own address toward the internet (no packet is sent); none: nothing to try.
+        let Some(me) = std::net::UdpSocket::bind("0.0.0.0:0").and_then(|u| u.connect("192.0.2.1:9").and_then(|()| u.local_addr())).ok().map(|a| a.ip()) else { return };
+        let port = 20000 + ((std::process::id() + 13) % 20000) as u16;
+        for (n, host) in [me, IpAddr::from([127, 0, 0, 1])].into_iter().enumerate() {
+            let addr = std::net::SocketAddr::new(host, port);
+            let key = std::env::temp_dir().join(format!("relay-test-seen-{}-{n}.key", std::process::id())).to_string_lossy().to_string();
+            thread::spawn(move || serve(&addr.to_string(), None, Some(&key)));
+        }
+        thread::sleep(Duration::from_millis(300));
+        let ask = |at: std::net::SocketAddr| {
+            let mut s = TcpStream::connect(at).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            writeln!(s, "seen").unwrap();
+            (line(&mut s).unwrap(), s.local_addr().unwrap())
+        };
+        let (said, mine) = ask(std::net::SocketAddr::new(me, port));
+        assert_eq!(said, mine.to_string());
+        assert_eq!(ask(std::net::SocketAddr::new(IpAddr::from([127, 0, 0, 1]), port)).0, "unknown");
     }
 
     /// New IDs count against their address the moment their listen comes: lines that leave

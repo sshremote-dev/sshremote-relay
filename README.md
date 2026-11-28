@@ -21,6 +21,7 @@ upgrade (`GET /relay` with `Upgrade: sshremote-relay`; the client's address in `
 | `accept ID NONCE` | the computer, on a new connection | `ok`, then the viewer's bytes |
 | `viewer ID` | a viewer | `ok`, then the computer's bytes; or `offline` |
 | `status ID` | anyone | `online` or `offline` |
+| `seen` | a computer looking for a straight TCP path | the address and port the connection comes from (`unknown` through a web server), the line then held open up to 30 s so its router keeps the way it made |
 | `secure E` | a computer, before `listen` | `secure E' S`, then a sealed line (below) |
 
 A computer seals its line to the relay (1.3 and later), so nobody in between reads its token or
